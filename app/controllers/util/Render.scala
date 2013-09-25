@@ -14,13 +14,7 @@ object Render {
   
   val scalateEngine = {
     val engine = new TemplateEngine
-    engine.resourceLoader = new ResourceLoader {
-      override def resource(uri: String): Option[Resource] = {
-        val is = engine.classLoader.getResourceAsStream("views/" + uri)
-        val s = new Scanner(is).useDelimiter("\\A")
-        Some(Resource.fromText(uri, s.next()))
-      }
-    }
+    engine.packagePrefix = "webTmpl"
     engine.layoutStrategy = new DefaultLayoutStrategy(engine, "layout/default.scaml")
     engine.classpath = "tmp/classes"
     engine.workingDirectory = Play.getFile("tmp")
