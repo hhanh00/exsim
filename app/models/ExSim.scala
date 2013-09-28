@@ -3,73 +3,41 @@ package models
 import akka.actor._
 import scala.collection.mutable.ArrayBuffer
 
-case class Order(symbol: String, buy: Boolean, price: Double, quantity: Long)
-case class Level(symbol: String, buy: Boolean, price: Double, quantity: Long)
+case class Amount(price: Double, quantity: Long)
+case class Order(symbol: String, buy: Boolean, price: Double, quantity: Long) extends HasAmount {
+  def toAmount = Amount(price, quantity)
+  val aggregate = false
+}
 case class Insert[A](i: Int, a: A)
 case class Delete[A](len: Int, a: A)
-case class Update[A](i: Int, a: A, dq: Long)
+case class Update[A](i: Int, a: A)
+
+trait HasAmount {
+  def toAmount: Amount
+  val aggregate: Boolean
+}
 
 trait MOut
-case class MultiUpdate[A](insert: Option[Insert[A]], delete: Option[Delete[A]], update: Option[Update[A]], execs: List[Order]) extends MOut
+case class Trade[T](a: Amount, s1: T, s2: T)
+case class Level[T](b: Boolean, a: Amount, t: T)
+
+case class MultiUpdate[A](insert: Option[Insert[Level[A]]], delete: Option[Delete[Level[A]]], update: Option[Update[Level[A]]], execs: List[Trade[A]]) extends MOut {
+  def this() = this(None, None, None, Nil)
+}
 case class Command(tpe: CommandTpe.Value, o: Order) extends MOut
 object CommandTpe extends Enumeration {
   val New, Amend, Cancel = Value
 }
 
-class MarketByPrice(slc: ActorRef, fix: ActorRef) extends Actor {
-  val buys = ArrayBuffer.empty[Level]
-  val sells = ArrayBuffer.empty[Level]
-  def receive = {
-    case mu: MultiUpdate[Order] => apply(mu)
-  }
-
-  def apply(mu: MultiUpdate[Order]) = {
-    println(s"Applying $mu")
-    val list = List(
-      mu.insert.map { i =>
-        (i.a.buy, i.a.price, i.a.quantity)
-      },
-      mu.update.map { u =>
-        (u.a.buy, u.a.price, u.dq)
-      },
-      mu.delete.map { d =>
-        (d.a.buy, d.a.price, -d.a.quantity)
-      })
-    val dqs = list.flatten.groupBy(e => (e._1, e._2)).map({ case (k, v) => k -> v.map(_._3).sum })
-    for (
-      (k, dq) <- dqs;
-      (b, p) = k
-    ) {
-      val s = side(b)
-      val q = s.find(l => l.price == p).getOrElse()
-
-    }
-  }
-
-  private def side(b: Boolean): ArrayBuffer[Level] = {
-    if (b)
-      buys
-    else
-      sells
-  }
-}
-
-class MarketByOrder(mbp: ActorRef) extends Actor {
-  val buys = ArrayBuffer.empty[Order]
-  val sells = ArrayBuffer.empty[Order]
-  def receive = {
-    case Command(CommandTpe.New, o) =>
-      val mu = newOrder(o, MultiUpdate[Order](None, None, None, Nil))
-      apply(mu)
-      dump()
-    case _ =>
-  }
+class MarketBy[T <: HasAmount](aggregate: Boolean) {
+  val buys = ArrayBuffer.empty[Level[T]]
+  val sells = ArrayBuffer.empty[Level[T]]
 
   def dump() = {
     println(buys, sells)
   }
 
-  def apply(mu: MultiUpdate[Order]) = {
+  def apply(mu: MultiUpdate[T]) = {
     println(s"Applying $mu")
     mu.insert.map { i =>
       val (b, _, _) = sides(i.a)
@@ -83,49 +51,65 @@ class MarketByOrder(mbp: ActorRef) extends Actor {
       val (b, _, _) = sides(d.a)
       b.remove(0, d.len)
     }
+    mu
   }
 
-  private def sides(o: Order): (ArrayBuffer[Order], ArrayBuffer[Order], (Order) => Boolean) = {
-    if (o.buy)
-      (buys, sells, (order) => order.price <= o.price)
+  private def sides(l: Level[T]): (ArrayBuffer[Level[T]], ArrayBuffer[Level[T]], (Amount) => Boolean) = {
+    if (l.b)
+      (buys, sells, (order) => order.price <= l.a.price)
     else
-      (sells, buys, (order) => order.price >= o.price)
+      (sells, buys, (order) => order.price >= l.a.price)
   }
 
-  private def newOrder(o: Order, mu: MultiUpdate[Order]): MultiUpdate[Order] = {
-    val (b, s, cmp) = sides(o)
-    val i = b.indexWhere(order => cmp(order))
+  private def add(l: Level[T], mu: MultiUpdate[T]): MultiUpdate[T] = {
+    val (b, s, cmp) = sides(l)
+    val i = b.indexWhere(level => cmp(level.a))
     val index = if (i < 0) buys.size else i
-    val mu2 = mu copy (insert = Some(Insert(index, o)))
+    val mu2 = if (aggregate && (i >= 0) && b(index).a.price == l.a.price) {
+      val muu = mu.update.getOrElse(Update(index, l copy (a = l.a copy (quantity = 0))))
+      mu copy (update = Some(muu copy (a = l copy (a = muu.a.a copy (quantity = b(index).a.quantity + l.a.quantity)))))
+    } else {
+      mu copy (insert = Some(Insert(index, l)))
+    }
 
-    def fill(o: Order, mu: MultiUpdate[Order]): MultiUpdate[Order] = {
-      val q = o.quantity
-      val p = o.price
+    def fill(l: Level[T], mu: MultiUpdate[T]): MultiUpdate[T] = {
+      val q = l.a.quantity
+      val p = l.a.price
 
-      def fillQ(qLeft: Long, index: Int, mu: MultiUpdate[Order]): MultiUpdate[Order] = {
-        if (qLeft == 0 || index >= s.size || s(index).price > p)
+      def fillQ(qLeft: Long, index: Int, mu: MultiUpdate[T]): MultiUpdate[T] = {
+        if (qLeft == 0 || index >= s.size || s(index).a.price > p)
           mu
         else {
-          val oo = s(index)
-          val execQ = Math.min(qLeft, oo.quantity)
-          val execs = List(o copy (quantity = execQ), oo copy (quantity = execQ))
+          val ol = s(index)
+          val execQ = Math.min(qLeft, ol.a.quantity)
+          val trade = Trade(Amount(p, execQ), l.t, ol.t)
 
-          if (qLeft < oo.quantity)
-            mu copy (insert = None, update = Some(Update(index, oo copy (quantity = oo.quantity - qLeft), -execQ)), execs = execs ++ mu.execs)
+          if (qLeft < ol.a.quantity)
+            mu copy (insert = None, update = Some(Update(index, ol copy (a = ol.a copy (quantity = ol.a.quantity - qLeft)))), execs = trade :: mu.execs)
           else {
-            val d = mu.delete.getOrElse(Delete(0, oo))
+            val d = mu.delete.getOrElse(Delete(0, ol))
             val d2 = d copy (len = d.len + 1)
             val i = mu.insert.get
-            val i2 = if (qLeft > oo.quantity) Some(i copy (a = i.a copy (quantity = i.a.quantity - oo.quantity))) else None
-            val m2 = mu copy (insert = i2, delete = Some(d2), execs = execs ++ mu.execs)
-            fillQ(qLeft - oo.quantity, index + 1, m2)
+            val i2 = if (qLeft > ol.a.quantity) Some(i copy (a = i.a copy (a = ol.a copy (quantity = i.a.a.quantity - ol.a.quantity)))) else None
+            val m2 = mu copy (insert = i2, delete = Some(d2), execs = trade :: mu.execs)
+            fillQ(qLeft - ol.a.quantity, index + 1, m2)
           }
         }
       }
       fillQ(q, 0, mu)
     }
-    fill(o, mu2)
+    fill(l, mu2)
   }
+
+  def addNew(buy: Boolean, a: Amount, o: T): MultiUpdate[T] = {
+    val mu = add(Level[T](buy, a, o), new MultiUpdate[T])
+    apply(mu)
+    dump()
+    mu
+  }
+
+  def bestBuy: Option[Amount] = buys.headOption.map(_.a)
+  def bestSell: Option[Amount] = sells.headOption.map(_.a)
 }
 
 class Dummy extends Actor {
@@ -134,19 +118,80 @@ class Dummy extends Actor {
   }
 }
 
+class MarketPrice {
+  var buy, sell, last: Option[Amount] = None
+  override def toString() = s"Bid: $buy, Ask: $sell, Last: $last"
+
+  def update(mbp: MarketBy[Null], execs: List[Trade[Order]]) {
+    buy = mbp.bestBuy
+    sell = mbp.bestSell
+    execs.headOption.map(t => last = Some(t.a))
+  }
+}
+
+class MarketTrades {
+  var trades: List[Trade[Order]] = Nil
+  
+  override def toString() = s"$trades"
+  def add(ts: List[Trade[Order]]) = trades ++= ts
+}
+
+class MarketBySymbol(symbol: String) {
+  val mbo = new MarketBy[Order](false)
+  val mbp = new MarketBy[Null](true)
+  val mp = new MarketPrice
+  val mt = new MarketTrades
+
+  def add(o: Order) = {
+    val execs = mbo.addNew(o.buy, o.toAmount, o).execs
+    mbp.addNew(o.buy, o.toAmount, null)
+    mp.update(mbp, execs)
+    mt.add(execs)
+    println(mp, mt, execs)
+  }
+}
+
 object ExSim extends App {
-  val system = ActorSystem()
-  val slc = system.actorOf(Props(classOf[Dummy]), "SLC")
-  val fix = system.actorOf(Props(classOf[Dummy]), "FIX")
-  val mbp = system.actorOf(Props(classOf[MarketByPrice], slc, fix), "MBP")
-  val mbo = system.actorOf(Props(classOf[MarketByOrder], mbp), "MBO")
+  testM()
 
-  val prices = List(10)
-  for (i <- prices) {
-    mbo ! Command(CommandTpe.New, Order("HSBC", false, i, 800))
+  def testM() = {
+    val m = new MarketBySymbol("HSBC")
+    val prices = List(10)
+    for (i <- prices) {
+      m.add(Order("HSBC", false, i, 800))
+      m.add(Order("HSBC", false, i, 800))
+      m.add(Order("HSBC", false, i, 800))
+    }
+    for (i <- prices) {
+      m.add(Order("HSBC", true, i, 800))
+      m.add(Order("HSBC", true, i, 800))
+      m.add(Order("HSBC", true, i, 800))
+    }
   }
-  for (i <- prices) {
-    mbo ! Command(CommandTpe.New, Order("HSBC", true, i, 400))
+  
+  def testMP() = {
+    val mbo = new MarketBy[Order](true)
+
   }
 
+  def testMO() = {
+    val mbo = new MarketBy[Order](true)
+
+    //  val system = ActorSystem()
+    //  val slc = system.actorOf(Props(classOf[Dummy]), "SLC")
+    //  val fix = system.actorOf(Props(classOf[Dummy]), "FIX")
+    ////  val mbp = system.actorOf(Props(classOf[MarketByPrice], slc, fix), "MBP")
+    //  val mbo = system.actorOf(Props(classOf[MarketByOrder[Order]], null), "MBO")
+    //
+    val prices = List(10)
+    for (i <- prices) {
+      mbo.addNew(false, Amount(i, 800), Order("HSBC", false, i, 800))
+      mbo.addNew(false, Amount(i, 800), Order("HSBC", false, i, 800))
+      mbo.addNew(false, Amount(i, 800), Order("HSBC", false, i, 800))
+    }
+    //    for (i <- prices) {
+    //      mbo.addNew(true, Order("HSBC", false, i, 1200))
+    //    }
+  }
+  //
 }
