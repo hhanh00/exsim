@@ -1,0 +1,17 @@
+# default settings for sessions
+[DEFAULT]
+  BeginString=FIX.4.2
+  StartTime=00:00:00
+  EndTime=23:59:59
+  HeartBtInt=20
+  FileLogPath=/tmp
+  FileStorePath=/tmp
+  UseDataDictionary=N
+
+[SESSION]
+  ConnectionType=initiator
+  SenderCompID=ARCA
+  TargetCompID=TW
+  SocketConnectPort=8010
+  SocketConnectHost=localhost
+  

@@ -3,11 +3,18 @@ package models
 import akka.actor._
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable.HashMap
+import quickfix.SessionID
 
 case class Amount(price: Double, quantity: Long)
-case class Order(id: String, symbol: String, buy: Boolean, price: Double, quantity: Long) extends HasAmount {
+case class Order(sessionId: SessionID, id: Option[String], clId: String, symbol: String, buy: Boolean, price: Double, quantity: Long) extends HasAmount {
   def toAmount = Amount(price, quantity)
   val aggregate = false
+  
+  override def hashCode = id.hashCode
+  override def equals(o: Any): Boolean = o match {
+    case other: Order => clId == other.clId
+    case _ => false
+  }
 }
 case class Insert[A](i: Int, a: A)
 case class Delete[A](i: Int, len: Int, a: A)
@@ -19,10 +26,10 @@ trait HasAmount {
 }
 
 trait MOut
-case class Trade[T](a: Amount, s1: T, s2: T)
+case class Trade[T](a: Amount, s1: Level[T], s2: Level[T])
 case class Level[T](b: Boolean, a: Amount, t: T)
 
-case class MultiUpdate[A](insert: Option[Insert[Level[A]]], delete: Option[Delete[Level[A]]], update: Option[Update[Level[A]]], execs: List[Trade[A]]) extends MOut {
+case class MultiUpdate[T](insert: Option[Insert[Level[T]]], delete: Option[Delete[Level[T]]], update: Option[Update[Level[T]]], execs: List[Trade[T]]) extends MOut {
   def this() = this(None, None, None, Nil)
   def isEmpty: Boolean = insert == None && delete == None && update == None
 }
@@ -84,7 +91,7 @@ class MarketBy[T <: HasAmount](aggregate: Boolean) {
         else {
           val ol = s(index)
           val execQ = Math.min(qLeft, ol.a.quantity)
-          val trade = Trade(Amount(p, execQ), l.t, ol.t)
+          val trade = Trade(Amount(p, execQ), l, ol)
 
           if (qLeft < ol.a.quantity)
             mu copy (insert = None, update = Some(Update(index, ol copy (a = ol.a copy (quantity = ol.a.quantity - qLeft)))), execs = trade :: mu.execs)
@@ -135,16 +142,15 @@ class Dummy extends Actor {
   }
 }
 
-class MarketPrice {
-  var buy, sell, last: Option[Amount] = None
-  override def toString() = s"Bid: $buy, Ask: $sell, Last: $last"
-
-  def update(mbp: MarketBy[Null], execs: List[Trade[Order]]) {
-    buy = mbp.bestBuy
-    sell = mbp.bestSell
-    execs.headOption.map(t => last = Some(t.a))
-  }
+case class MarketPrice(buy: Option[Amount] = None, sell: Option[Amount] = None, last: Option[Amount] = None) {
+  def update(mbp: MarketBy[Null], execs: List[Trade[Order]]): MarketPrice = MarketPrice(mbp.bestBuy, mbp.bestSell, execs.headOption.map(_.a))
+  def diff(that: MarketPrice): MarketPrice = MarketPrice(
+    if (buy == that.buy) None else that.buy,
+    if (sell == that.sell) None else that.sell,
+    if (last == that.last) None else that.last)
 }
+
+case class Updates(mp: MarketPrice, mbp: MultiUpdate[Null], mbo: MultiUpdate[Order])
 
 class MarketTrades {
   var trades: List[Trade[Order]] = Nil
@@ -156,15 +162,20 @@ class MarketTrades {
 class MarketBySymbol(symbol: String) {
   val mbo = new MarketBy[Order](false)
   val mbp = new MarketBy[Null](true)
-  val mp = new MarketPrice
+  var mp = MarketPrice()
   val mt = new MarketTrades
 
-  def add(o: Order): Unit = {
-    val execs = mbo.addNew(o.buy, o.toAmount, o).execs
-    mbp.addNew(o.buy, o.toAmount, null)
-    mp.update(mbp, execs)
+  def add(o: Order): Updates = {
+    val mbou = mbo.addNew(o.buy, o.toAmount, o)
+    val execs = mbou.execs
+    val mbpu = mbp.addNew(o.buy, o.toAmount, null)
+    val newMp = mp.update(mbp, execs)
+    val diffMp = mp.diff(newMp)
+    mp = newMp
+    
     mt.add(execs)
     println(mp, mt, execs)
+    Updates(diffMp, mbpu, mbou)
   }
 
   def cancel(o: Order): Unit = {
@@ -181,7 +192,7 @@ class MarketBySymbolActor extends Actor {
   val ms = HashMap.empty[String, MarketBySymbol]
 
   def receive = {
-    case MarketBySymbolMessage.Add(o) => getOrCreate(o.symbol).add(o)
+    case MarketBySymbolMessage.Add(o) => sender ! getOrCreate(o.symbol).add(o)
     case MarketBySymbolMessage.Update(oldO, newO) =>
       getOrCreate(oldO.symbol).cancel(oldO)
       getOrCreate(newO.symbol).add(newO)
@@ -195,46 +206,4 @@ object MarketBySymbolMessage {
   case class Add(o: Order)
   case class Update(oldO: Order, newO: Order)
   case class Delete(o: Order)
-}
-
-object ExSim extends App {
-  val system = ActorSystem()
-  val market = system.actorOf(Props(classOf[MarketBySymbolActor]), "Market")
-
-  testM(market)
-
-  def testM(m: ActorRef) = {
-    val prices = List(10)
-    for (i <- prices) {
-      m ! MarketBySymbolMessage.Add(Order("S-" + i.toString, "HSBC", false, i, 800))
-    }
-    for (i <- prices) {
-      m ! MarketBySymbolMessage.Add(Order("B-" + i.toString, "HSBC", true, i, 800))
-    }
-  }
-
-  def testMP() = {
-    val mbo = new MarketBy[Order](true)
-  }
-
-  def testMO() = {
-    val mbo = new MarketBy[Order](true)
-
-    //  val system = ActorSystem()
-    //  val slc = system.actorOf(Props(classOf[Dummy]), "SLC")
-    //  val fix = system.actorOf(Props(classOf[Dummy]), "FIX")
-    ////  val mbp = system.actorOf(Props(classOf[MarketByPrice], slc, fix), "MBP")
-    //  val mbo = system.actorOf(Props(classOf[MarketByOrder[Order]], null), "MBO")
-    //
-    val prices = List(10)
-    for (i <- prices) {
-      mbo.addNew(false, Amount(i, 800), Order("0", "HSBC", false, i, 800))
-      mbo.addNew(false, Amount(i, 800), Order("0", "HSBC", false, i, 800))
-      mbo.addNew(false, Amount(i, 800), Order("0", "HSBC", false, i, 800))
-    }
-    //    for (i <- prices) {
-    //      mbo.addNew(true, Order("HSBC", false, i, 1200))
-    //    }
-  }
-  //
 }
