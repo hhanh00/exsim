@@ -2,14 +2,15 @@ package models
 
 import akka.actor._
 import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.HashMap
 
 case class Amount(price: Double, quantity: Long)
-case class Order(symbol: String, buy: Boolean, price: Double, quantity: Long) extends HasAmount {
+case class Order(id: String, symbol: String, buy: Boolean, price: Double, quantity: Long) extends HasAmount {
   def toAmount = Amount(price, quantity)
   val aggregate = false
 }
 case class Insert[A](i: Int, a: A)
-case class Delete[A](len: Int, a: A)
+case class Delete[A](i: Int, len: Int, a: A)
 case class Update[A](i: Int, a: A)
 
 trait HasAmount {
@@ -23,6 +24,7 @@ case class Level[T](b: Boolean, a: Amount, t: T)
 
 case class MultiUpdate[A](insert: Option[Insert[Level[A]]], delete: Option[Delete[Level[A]]], update: Option[Update[Level[A]]], execs: List[Trade[A]]) extends MOut {
   def this() = this(None, None, None, Nil)
+  def isEmpty: Boolean = insert == None && delete == None && update == None
 }
 case class Command(tpe: CommandTpe.Value, o: Order) extends MOut
 object CommandTpe extends Enumeration {
@@ -40,15 +42,15 @@ class MarketBy[T <: HasAmount](aggregate: Boolean) {
   def apply(mu: MultiUpdate[T]) = {
     println(s"Applying $mu")
     mu.insert.map { i =>
-      val (b, _, _) = sides(i.a)
+      val b = sides(i.a)._1
       b.insert(i.i, i.a)
     }
     mu.update.map { u =>
-      val (b, _, _) = sides(u.a)
+      val b = sides(u.a)._1
       b(u.i) = u.a
     }
     mu.delete.map { d =>
-      val (b, _, _) = sides(d.a)
+      val b = sides(d.a)._1
       b.remove(0, d.len)
     }
     mu
@@ -56,9 +58,9 @@ class MarketBy[T <: HasAmount](aggregate: Boolean) {
 
   private def sides(l: Level[T]): (ArrayBuffer[Level[T]], ArrayBuffer[Level[T]], (Amount) => Boolean) = {
     if (l.b)
-      (buys, sells, (order) => order.price <= l.a.price)
+      (buys, sells, (a) => a.price <= l.a.price)
     else
-      (sells, buys, (order) => order.price >= l.a.price)
+      (sells, buys, (a) => a.price >= l.a.price)
   }
 
   private def add(l: Level[T], mu: MultiUpdate[T]): MultiUpdate[T] = {
@@ -87,7 +89,7 @@ class MarketBy[T <: HasAmount](aggregate: Boolean) {
           if (qLeft < ol.a.quantity)
             mu copy (insert = None, update = Some(Update(index, ol copy (a = ol.a copy (quantity = ol.a.quantity - qLeft)))), execs = trade :: mu.execs)
           else {
-            val d = mu.delete.getOrElse(Delete(0, ol))
+            val d = mu.delete.getOrElse(Delete(0, 0, ol))
             val d2 = d copy (len = d.len + 1)
             val i = mu.insert.get
             val i2 = if (qLeft > ol.a.quantity) Some(i copy (a = i.a copy (a = ol.a copy (quantity = i.a.a.quantity - ol.a.quantity)))) else None
@@ -101,8 +103,23 @@ class MarketBy[T <: HasAmount](aggregate: Boolean) {
     fill(l, mu2)
   }
 
+  def cancel(l: Level[T]): MultiUpdate[T] = {
+    val (b, _, _) = sides(l)
+    val i = b.indexWhere(lvl => lvl.t == l.t)
+    if (i >= 0) {
+      new MultiUpdate[T] copy (delete = Some(Delete(i, 1, l)))
+    } else new MultiUpdate[T]
+  }
+
   def addNew(buy: Boolean, a: Amount, o: T): MultiUpdate[T] = {
     val mu = add(Level[T](buy, a, o), new MultiUpdate[T])
+    apply(mu)
+    dump()
+    mu
+  }
+
+  def cancelOld(buy: Boolean, a: Amount, o: T): MultiUpdate[T] = {
+    val mu = cancel(Level[T](buy, a, o))
     apply(mu)
     dump()
     mu
@@ -131,7 +148,7 @@ class MarketPrice {
 
 class MarketTrades {
   var trades: List[Trade[Order]] = Nil
-  
+
   override def toString() = s"$trades"
   def add(ts: List[Trade[Order]]) = trades ++= ts
 }
@@ -142,36 +159,62 @@ class MarketBySymbol(symbol: String) {
   val mp = new MarketPrice
   val mt = new MarketTrades
 
-  def add(o: Order) = {
+  def add(o: Order): Unit = {
     val execs = mbo.addNew(o.buy, o.toAmount, o).execs
     mbp.addNew(o.buy, o.toAmount, null)
     mp.update(mbp, execs)
     mt.add(execs)
     println(mp, mt, execs)
   }
+
+  def cancel(o: Order): Unit = {
+    val mu = mbo.cancelOld(o.buy, o.toAmount, o)
+    if (!mu.isEmpty) {
+      val a = o.toAmount
+      val negAmount = a copy (quantity = -a.quantity)
+      mbp.addNew(o.buy, negAmount, null)
+    }
+  }
+}
+
+class MarketBySymbolActor extends Actor {
+  val ms = HashMap.empty[String, MarketBySymbol]
+
+  def receive = {
+    case MarketBySymbolMessage.Add(o) => getOrCreate(o.symbol).add(o)
+    case MarketBySymbolMessage.Update(oldO, newO) =>
+      getOrCreate(oldO.symbol).cancel(oldO)
+      getOrCreate(newO.symbol).add(newO)
+    case MarketBySymbolMessage.Delete(o) => getOrCreate(o.symbol).cancel(o)
+  }
+
+  private def getOrCreate(s: String) = ms.getOrElseUpdate(s, new MarketBySymbol(s))
+}
+
+object MarketBySymbolMessage {
+  case class Add(o: Order)
+  case class Update(oldO: Order, newO: Order)
+  case class Delete(o: Order)
 }
 
 object ExSim extends App {
-  testM()
+  val system = ActorSystem()
+  val market = system.actorOf(Props(classOf[MarketBySymbolActor]), "Market")
 
-  def testM() = {
-    val m = new MarketBySymbol("HSBC")
+  testM(market)
+
+  def testM(m: ActorRef) = {
     val prices = List(10)
     for (i <- prices) {
-      m.add(Order("HSBC", false, i, 800))
-      m.add(Order("HSBC", false, i, 800))
-      m.add(Order("HSBC", false, i, 800))
+      m ! MarketBySymbolMessage.Add(Order("S-" + i.toString, "HSBC", false, i, 800))
     }
     for (i <- prices) {
-      m.add(Order("HSBC", true, i, 800))
-      m.add(Order("HSBC", true, i, 800))
-      m.add(Order("HSBC", true, i, 800))
+      m ! MarketBySymbolMessage.Add(Order("B-" + i.toString, "HSBC", true, i, 800))
     }
   }
-  
+
   def testMP() = {
     val mbo = new MarketBy[Order](true)
-
   }
 
   def testMO() = {
@@ -185,9 +228,9 @@ object ExSim extends App {
     //
     val prices = List(10)
     for (i <- prices) {
-      mbo.addNew(false, Amount(i, 800), Order("HSBC", false, i, 800))
-      mbo.addNew(false, Amount(i, 800), Order("HSBC", false, i, 800))
-      mbo.addNew(false, Amount(i, 800), Order("HSBC", false, i, 800))
+      mbo.addNew(false, Amount(i, 800), Order("0", "HSBC", false, i, 800))
+      mbo.addNew(false, Amount(i, 800), Order("0", "HSBC", false, i, 800))
+      mbo.addNew(false, Amount(i, 800), Order("0", "HSBC", false, i, 800))
     }
     //    for (i <- prices) {
     //      mbo.addNew(true, Order("HSBC", false, i, 1200))
