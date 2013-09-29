@@ -31,7 +31,6 @@ class BuySide extends Application {
     newOrderSingle.set(new Price(price))
     newOrderSingle.set(new Side(if (buy) Side.BUY else Side.SELL))
     Session.sendToTarget(newOrderSingle, "ARCA", "TW")
-
   }
 }
 
@@ -46,9 +45,39 @@ object BuySide extends App {
   val login = new Logon(new EncryptMethod, new HeartBtInt(30))
   Session.sendToTarget(login, "ARCA", "TW")
   Thread.sleep(5000)
-  
-  app.newOrderSingle("B", true, 100.0, 800)
-  //app.newOrderSingle("S", false, 100.0, 800)
 
+  testFill2Levels()
+  
   Thread.sleep(5000)
+
+  /* No fill */
+  def testNoFill() = {
+    app.newOrderSingle("S", false, 100.0, 800)
+  }
+
+  /* Both orders are filled */
+  def testFill() = {
+    app.newOrderSingle("S", false, 100.0, 800)
+    app.newOrderSingle("B", true, 100.0, 800)
+  }
+
+  /* Second order is filled, first is partially filled */
+  def testPartialFill() = {
+    app.newOrderSingle("S", false, 100.0, 800)
+    app.newOrderSingle("B", true, 100.0, 400)
+  }
+
+  /* First order is filled, second is partially filled */
+  def testPartialFill2() = {
+    app.newOrderSingle("S", false, 100.0, 400)
+    app.newOrderSingle("B", true, 100.0, 800)
+  }
+
+  /* S2, S3 and B are filled - S1 is partially filled */
+  def testFill2Levels() = {
+    app.newOrderSingle("S1", false, 100.0, 800)
+    app.newOrderSingle("S2", false, 101.0, 400)
+    app.newOrderSingle("S3", false, 101.0, 800)
+    app.newOrderSingle("B", true, 101.0, 1600)
+  }
 }
