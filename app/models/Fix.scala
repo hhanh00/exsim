@@ -95,7 +95,7 @@ class Fix(self: ActorRef, market: ActorRef) extends MessageCracker with quickfix
     er.set(new LeavesQty(o.quantity - a.quantity))
     er.set(new CumQty(a.quantity))
 
-    println(er)
+    println(s"ER CumQTY=${a.quantity} LQTY=${o.quantity - a.quantity} ORDER=$o")
     Session.sendToTarget(er, o.sessionId.getSenderCompID, o.sessionId.getTargetCompID)
   }
 }
@@ -117,9 +117,9 @@ class FixActor(market: ActorRef, settingsFile: String) extends Actor {
         report(exec.s1)
         report(exec.s2)
         def report(level: Level[Order]) = {
-          val leavesAmount = Amount(level.a.price, level.a.quantity - exec.a.quantity)
-          val filled = leavesAmount.quantity == 0
-          fixApp.reportExecution(level.t, level.a, new OrdStatus(if (filled) OrdStatus.FILLED else OrdStatus.PARTIALLY_FILLED), new ExecType(if (filled) ExecType.FILL else ExecType.PARTIAL_FILL))
+          val cumAmount = Amount(level.a.price, level.t.quantity - level.a.quantity + exec.a.quantity)
+          val filled = cumAmount.quantity == level.t.quantity
+          fixApp.reportExecution(level.t, cumAmount, new OrdStatus(if (filled) OrdStatus.FILLED else OrdStatus.PARTIALLY_FILLED), new ExecType(if (filled) ExecType.FILL else ExecType.PARTIAL_FILL))
         }
       }
   }

@@ -47,7 +47,8 @@ object BuySide extends App {
   Session.sendToTarget(login, "ARCA", "TW")
   Thread.sleep(5000)
   
-  app.newOrderSingle("B", true, 100.0, 400)
+  app.newOrderSingle("B", true, 100.0, 800)
+  //app.newOrderSingle("S", false, 100.0, 800)
 
   Thread.sleep(5000)
 }
